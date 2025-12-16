@@ -1,0 +1,181 @@
+# GitLab CI/CD Configuration for SQL Injection Security Testing
+#
+# This is an example configuration showing how to integrate SQL Injection Testing
+# into your GitLab CI/CD pipeline.
+#
+# ⚠️ IMPORTANT: Only run this against systems you own or have permission to test!
+#
+# To use:
+# 1. Rename to .gitlab-ci.yml
+# 2. Configure TEST_ENVIRONMENT_URL variable in GitLab CI/CD settings
+# 3. Ensure you have proper authorization to test the target
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  TEST_URL: "${TEST_ENVIRONMENT_URL:-http://localhost:8080}"
+
+stages:
+  - build
+  - security-test
+  - report
+
+# Cache Maven dependencies
+cache:
+  paths:
+    - .m2/repository
+    - sqli-cli/target/
+
+build:
+  stage: build
+  image: maven:3.9-eclipse-temurin-17
+  script:
+    - echo "Building SQL Injection Testing Framework..."
+    - mvn clean package -DskipTests
+    - ls -lh sqli-cli/target/
+  artifacts:
+    paths:
+      - sqli-cli/target/sqli-tester.jar
+    expire_in: 1 day
+
+security-scan-quick:
+  stage: security-test
+  image: eclipse-temurin:17-jre
+  dependencies:
+    - build
+  script:
+    - echo "Running quick security scan..."
+    - mkdir -p reports
+
+    # Test common endpoints
+    - |
+      java -jar sqli-cli/target/sqli-tester.jar test \
+        --url "${TEST_URL}/api/users?id=1" \
+        --mode quick \
+        --output reports/users-scan.json \
+        --yes
+
+    - |
+      java -jar sqli-cli/target/sqli-tester.jar test \
+        --url "${TEST_URL}/api/search?q=test" \
+        --mode quick \
+        --output reports/search-scan.json \
+        --yes
+
+    # Generate HTML report
+    - |
+      java -jar sqli-cli/target/sqli-tester.jar test \
+        --url "${TEST_URL}/api/users?id=1" \
+        --mode quick \
+        --output reports/security-report.html \
+        --yes
+
+    # Check for vulnerabilities
+    - |
+      if [ -f reports/users-scan.json ]; then
+        VULN_COUNT=$(grep -o '"vulnerabilities"' reports/users-scan.json | wc -l)
+        echo "Vulnerabilities found: $VULN_COUNT"
+        if [ "$VULN_COUNT" -gt 0 ]; then
+          echo "❌ Security vulnerabilities detected!"
+          exit 1
+        fi
+      fi
+
+  artifacts:
+    when: always
+    paths:
+      - reports/
+    reports:
+      junit: reports/*.json
+    expire_in: 30 days
+  allow_failure: false
+
+security-scan-deep:
+  stage: security-test
+  image: eclipse-temurin:17-jre
+  dependencies:
+    - build
+  script:
+    - echo "Running deep security scan..."
+    - mkdir -p reports-deep
+
+    - |
+      java -jar sqli-cli/target/sqli-tester.jar test \
+        --url "${TEST_URL}/api/users?id=1" \
+        --mode deep \
+        --output reports-deep/deep-scan.json \
+        --yes
+
+    - |
+      java -jar sqli-cli/target/sqli-tester.jar test \
+        --url "${TEST_URL}/api/users?id=1" \
+        --mode deep \
+        --output reports-deep/deep-scan.html \
+        --yes
+
+  artifacts:
+    when: always
+    paths:
+      - reports-deep/
+    expire_in: 30 days
+  allow_failure: true
+  # Only run deep scan on main branch or manually
+  only:
+    - main
+    - schedules
+    - web
+
+# Generate security badge
+generate-badge:
+  stage: report
+  image: eclipse-temurin:17-jre
+  dependencies:
+    - security-scan-quick
+  script:
+    - |
+      if [ -f reports/users-scan.json ]; then
+        VULN_COUNT=$(jq '.vulnerabilities | length' reports/users-scan.json 2>/dev/null || echo "0")
+        if [ "$VULN_COUNT" -eq 0 ]; then
+          echo "Security Status: PASSED" > security-badge.txt
+          COLOR="success"
+        else
+          echo "Security Status: FAILED ($VULN_COUNT vulnerabilities)" > security-badge.txt
+          COLOR="critical"
+        fi
+        echo "Badge color: $COLOR"
+      fi
+  artifacts:
+    paths:
+      - security-badge.txt
+    expire_in: 7 days
+  when: always
+
+# Schedule nightly deep scans
+security-scheduled:
+  extends: security-scan-deep
+  only:
+    - schedules
+  variables:
+    SCAN_MODE: "deep"
+
+# Pages: Publish HTML reports to GitLab Pages
+pages:
+  stage: report
+  dependencies:
+    - security-scan-quick
+    - security-scan-deep
+  script:
+    - mkdir -p public
+    - |
+      if [ -f reports/security-report.html ]; then
+        cp reports/security-report.html public/index.html
+      fi
+    - |
+      if [ -d reports-deep ]; then
+        cp -r reports-deep/*.html public/ 2>/dev/null || true
+      fi
+    - echo "Security reports available at GitLab Pages"
+  artifacts:
+    paths:
+      - public
+  only:
+    - main

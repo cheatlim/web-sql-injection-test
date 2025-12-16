@@ -1,0 +1,241 @@
+// Jenkinsfile for SQL Injection Security Testing
+//
+// This is an example Jenkins Pipeline showing how to integrate SQL Injection Testing
+// into your Jenkins CI/CD pipeline.
+//
+// ⚠️ IMPORTANT: Only run this against systems you own or have permission to test!
+//
+// To use:
+// 1. Rename to Jenkinsfile
+// 2. Configure TEST_ENVIRONMENT_URL in Jenkins credentials
+// 3. Ensure you have proper authorization to test the target
+
+pipeline {
+    agent any
+
+    // Configure environment variables
+    environment {
+        TEST_URL = credentials('TEST_ENVIRONMENT_URL') ?: 'http://localhost:8080'
+        SLACK_WEBHOOK = credentials('SLACK_WEBHOOK_URL')
+    }
+
+    // Schedule nightly security scans
+    triggers {
+        cron('H 2 * * *')  // Run daily at 2 AM
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+    }
+
+    tools {
+        maven 'Maven 3.9'
+        jdk 'JDK 17'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code...'
+                checkout scm
+            }
+        }
+
+        stage('Build') {
+            steps {
+                echo 'Building SQL Injection Testing Framework...'
+                sh 'mvn clean package -DskipTests'
+                sh 'ls -lh sqli-cli/target/'
+            }
+        }
+
+        stage('Security Scan - Quick') {
+            steps {
+                echo 'Running quick security scan...'
+                script {
+                    sh 'mkdir -p reports'
+
+                    // Test multiple endpoints
+                    def endpoints = [
+                        '/api/users?id=1',
+                        '/api/search?q=test',
+                        '/api/products?category=electronics'
+                    ]
+
+                    endpoints.each { endpoint ->
+                        def safeName = endpoint.replaceAll('[^a-zA-Z0-9]', '_')
+                        sh """
+                            java -jar sqli-cli/target/sqli-tester.jar test \\
+                                --url "\${TEST_URL}${endpoint}" \\
+                                --mode quick \\
+                                --output reports/${safeName}.json \\
+                                --yes || true
+                        """
+                    }
+
+                    // Generate HTML reports
+                    sh """
+                        java -jar sqli-cli/target/sqli-tester.jar test \\
+                            --url "\${TEST_URL}/api/users?id=1" \\
+                            --mode quick \\
+                            --output reports/security-report.html \\
+                            --yes || true
+                    """
+                }
+            }
+        }
+
+        stage('Security Scan - Deep') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'master'
+                    triggeredBy 'TimerTrigger'
+                }
+            }
+            steps {
+                echo 'Running deep security scan...'
+                sh 'mkdir -p reports/deep'
+
+                sh """
+                    java -jar sqli-cli/target/sqli-tester.jar test \\
+                        --url "\${TEST_URL}/api/users?id=1" \\
+                        --mode deep \\
+                        --output reports/deep/deep-scan.json \\
+                        --yes || true
+                """
+
+                sh """
+                    java -jar sqli-cli/target/sqli-tester.jar test \\
+                        --url "\${TEST_URL}/api/users?id=1" \\
+                        --mode deep \\
+                        --output reports/deep/deep-scan.html \\
+                        --yes || true
+                """
+            }
+        }
+
+        stage('Analyze Results') {
+            steps {
+                script {
+                    echo 'Analyzing security scan results...'
+
+                    // Count vulnerabilities
+                    def vulnCount = 0
+                    def criticalCount = 0
+                    def highCount = 0
+
+                    sh """
+                        if [ -f reports/_api_users_id_1.json ]; then
+                            jq '.vulnerabilities | length' reports/_api_users_id_1.json > vuln_count.txt || echo "0" > vuln_count.txt
+                            jq '[.vulnerabilities[] | select(.severity == "CRITICAL")] | length' reports/_api_users_id_1.json > critical_count.txt || echo "0" > critical_count.txt
+                            jq '[.vulnerabilities[] | select(.severity == "HIGH")] | length' reports/_api_users_id_1.json > high_count.txt || echo "0" > high_count.txt
+                        else
+                            echo "0" > vuln_count.txt
+                            echo "0" > critical_count.txt
+                            echo "0" > high_count.txt
+                        fi
+                    """
+
+                    vulnCount = readFile('vuln_count.txt').trim().toInteger()
+                    criticalCount = readFile('critical_count.txt').trim().toInteger()
+                    highCount = readFile('high_count.txt').trim().toInteger()
+
+                    echo "Total vulnerabilities: ${vulnCount}"
+                    echo "Critical: ${criticalCount}"
+                    echo "High: ${highCount}"
+
+                    // Fail build if critical vulnerabilities found
+                    if (criticalCount > 0) {
+                        error("❌ Critical security vulnerabilities detected! Failing build.")
+                    } else if (highCount > 0) {
+                        unstable("⚠️ High severity vulnerabilities detected. Build marked as unstable.")
+                    } else if (vulnCount > 0) {
+                        echo "⚠️ Low/Medium vulnerabilities detected. Review recommended."
+                    } else {
+                        echo "✅ No security vulnerabilities detected."
+                    }
+                }
+            }
+        }
+
+        stage('Publish Reports') {
+            steps {
+                echo 'Publishing security reports...'
+
+                // Archive artifacts
+                archiveArtifacts artifacts: 'reports/**/*', allowEmptyArchive: true
+
+                // Publish HTML reports
+                publishHTML([
+                    reportDir: 'reports',
+                    reportFiles: 'security-report.html',
+                    reportName: 'Security Scan Report',
+                    keepAll: true,
+                    alwaysLinkToLastBuild: true
+                ])
+
+                // Publish test results if using JUnit format
+                junit allowEmptyResults: true, testResults: 'reports/*.xml'
+            }
+        }
+    }
+
+    post {
+        always {
+            // Clean workspace
+            cleanWs deleteDirs: true, notFailBuild: true
+        }
+
+        success {
+            echo '✅ Security scan completed successfully!'
+        }
+
+        failure {
+            echo '❌ Security scan failed or vulnerabilities detected!'
+
+            // Send notification
+            script {
+                if (env.SLACK_WEBHOOK) {
+                    sh """
+                        curl -X POST \${SLACK_WEBHOOK} \\
+                            -H 'Content-Type: application/json' \\
+                            -d '{
+                                "text": "🚨 SQL Injection security scan failed in ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                                "blocks": [
+                                    {
+                                        "type": "section",
+                                        "text": {
+                                            "type": "mrkdwn",
+                                            "text": "*Security Scan Failed*\\n\\nJob: ${env.JOB_NAME}\\nBuild: #${env.BUILD_NUMBER}\\n\\n<${env.BUILD_URL}|View Details>"
+                                        }
+                                    }
+                                ]
+                            }'
+                    """
+                }
+
+                // Email notification
+                emailext(
+                    subject: "Security Alert: SQL Injection Scan Failed - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                        <h2>Security Scan Alert</h2>
+                        <p>SQL Injection security vulnerabilities were detected in your application.</p>
+                        <p><strong>Job:</strong> ${env.JOB_NAME}</p>
+                        <p><strong>Build:</strong> #${env.BUILD_NUMBER}</p>
+                        <p><strong>URL:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                        <p>Please review the security report and fix the identified issues.</p>
+                    """,
+                    to: '$DEFAULT_RECIPIENTS',
+                    mimeType: 'text/html'
+                )
+            }
+        }
+
+        unstable {
+            echo '⚠️ Security scan completed with warnings.'
+        }
+    }
+}
