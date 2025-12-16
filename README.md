@@ -89,8 +89,8 @@ This framework helps developers and security professionals identify SQL injectio
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/sqli-tester.git
-cd sqli-tester
+git clone https://github.com/cheatlim/web-sql-injection-test
+cd web-sql-injection-test
 ```
 
 2. Build the project:
